@@ -1,0 +1,16 @@
+[package]
+name = "shafiles"
+version = "0.1.0"
+authors = ["Steve <stevemflanagan@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.11"
+stderrlog = "0.4.3"
+anyhow = "1.0.32"
+crossbeam-channel = "0.4.3"
+structopt = "0.3.16"
+chrono = "0.4.13"
+sha1 = "0.6.0"
