@@ -2,6 +2,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+mod sha_state;
+
+
 use std::thread::spawn;
 use std::path::{PathBuf, Path};
 use crossbeam_channel::{Sender, Receiver};
@@ -16,6 +19,9 @@ mod worker_queue;
 use worker_queue::WorkerQueue;
 use std::io::Read;
 use std::time::Duration;
+use crate::sha_state::{ShaState, ShaSet, DiffResult};
+use std::sync::{Arc, RwLock, Mutex};
+use crate::cli::Cli;
 
 fn main() {
     if let Err(err) = sha_them_all() {
@@ -74,9 +80,9 @@ fn _read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, send: &mut Sender<
     }
 }
 
-fn sha_files(recv: &Receiver<Option<PathBuf>>) {
+fn sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) {
     loop {
-        match _sha_files(recv) {
+        match _sha_files(recv, send) {
             Err(e) => {
                 error!("sha_file thread top: {}", e);
             }
@@ -86,46 +92,76 @@ fn sha_files(recv: &Receiver<Option<PathBuf>>) {
 
 }
 
-fn _sha_files(recv: &Receiver<Option<PathBuf>>) -> Result<()> {
+fn _sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) -> Result<()> {
+    let mut buf = vec![0u8; 64*1024*1024];
     loop {
         trace!("waiting...");
         match recv.recv()? {
             None => return Ok(()), // this is the end my friend
             Some(path) => {
-                match sha_a_file(&path) {
-                    Err(e) => error!("sha1 on file fail"),
-                    Ok(()) => (),
+                match sha_a_file(&path, &mut buf) {
+                    Err(e) => {error!("sha1 on file fail"); ()},
+                    Ok(state) => {send.send(Some(state))?; ()},
                 }
             },
         };
     }
 }
 
-fn sha_a_file(path: &Path) -> Result<()> {
+fn sha_a_file(path: &Path, buf: &mut Vec<u8>) -> Result<ShaState> {
     let mut file = fs::File::open(&path).context("open failed")?;
-    let hash = sha1_digest(&mut file).context("digest_reader failed")?;
+    let hash = sha1_digest(&mut file, buf).context("digest_reader failed")?;
     info!("path: \"{}\" sha1: {}", path.display(), &hash.to_string());
-    Ok(())
+    let mtime = path.metadata()?.modified()?;
+    Ok(ShaState::new(path.to_path_buf(), hash, mtime))
 }
-fn sha1_digest<R: Read>(mut reader: R) -> Result<Digest> {
+fn sha1_digest<R: Read>(mut reader: R, buf: &mut Vec<u8>) -> Result<Digest> {
     trace!("doing sha1 on file");
     let mut m = sha1::Sha1::new();
-    let mut buffer = [0; 1024*1024];
+    //let mut buffer = [0; 1024*1024];
 
     loop {
-        let count = reader.read(&mut buffer)?;
+        let count = reader.read(&mut buf[..])?;
         if count == 0 {
             break;
         }
-        m.update(&buffer[..count]);
+        m.update(&buf[..count]);
     }
 
     Ok(m.digest())
 }
 
+fn record_state(cli: &Arc<Cli>, recv: Receiver<Option<ShaState>>, state: &mut Arc<Mutex<ShaSet>>) {
+    loop {
+        match recv.recv() {
+            Err(e) => panic!("write thread errored during receive: {}", e),
+            Ok(None) => return,
+            Ok(Some(state_entry)) => {
+                match state.lock() {
+                    Err(e) => panic!("write thread error locking state {}", e),
+                    Ok(mut state) => {
+                        let info = state_entry.to_string();
+                        match state.add(state_entry) {
+                            Err(e) => error!("Cannot add entry for {} due to {}", info, e),
+                            Ok(diff) => {
+                                match diff {
+                                    DiffResult::ShaDiff => warn!("SHA CHANGE: {}", info),
+                                    DiffResult::TimeDiff => warn!("TIME CHANGE: {}", info),
+                                    _ => (),
+                                }
+                            }
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+}
+
 fn sha_them_all() -> Result<()>{
     println!("Hello, world!");
-    let cli = crate::cli::get_cli();
+    let cli = Arc::new(crate::cli::get_cli());
 
     stderrlog::new()
         .module(module_path!())
@@ -135,11 +171,20 @@ fn sha_them_all() -> Result<()>{
         .init()
         .unwrap();
 
-    let mut dir_q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(cli.dir_threads, 0);
+    let mut dir_q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(cli.threads_dir, 0);
     let (send,recv) = crossbeam_channel::unbounded();
+    let (send_state,recv_state) = crossbeam_channel::unbounded();
+
+    let mut state = Arc::new(Mutex::new(ShaSet::new(&cli.state_path)?));
+
+    let h_state_write = {
+        let cli_c = cli.clone();
+        let mut state_c = state.clone();
+        spawn(move|| record_state(&cli_c, recv_state, &mut state_c))
+    };
 
     let mut h_dir_threads = vec![];
-    for _i in 0..cli.dir_threads {
+    for _i in 0..cli.threads_dir {
         let mut dir_q = dir_q.clone();
         let mut send = send.clone();
         let h = spawn(move || read_dir_thread(&mut dir_q, &mut send));
@@ -147,9 +192,10 @@ fn sha_them_all() -> Result<()>{
     }
 
     let mut h_sha_threads = vec![];
-    for _i in 0..cli.sha_threads {
+    for _i in 0..cli.threads_sha {
         let mut recv = recv.clone();
-        let h = spawn(move || sha_files(&mut recv));
+        let mut send_state = send_state.clone();
+        let h = spawn(move || sha_files(&mut recv, &mut send_state));
         h_sha_threads.push(h);
     }
 
@@ -162,20 +208,29 @@ fn sha_them_all() -> Result<()>{
         let x = dir_q.wait_for_finish_timeout(Duration::from_millis(250))?;
         if x != -1 { break; }
     }
-    for _ in 0..cli.dir_threads { dir_q.push(None)?; }
+    for _ in 0..cli.threads_dir { dir_q.push(None)?; }
     for h in h_dir_threads {
         h.join().unwrap();
     }
     info!("directory scanning is done");
 
     // wait on sha threads
-    for _ in 0..cli.sha_threads { send.send(None)?; }
+    for _ in 0..cli.threads_sha { send.send(None)?; }
     for h in h_sha_threads {
         h.join().unwrap();
     }
+
+    send_state.send(None)?;
+    h_state_write.join().unwrap();
+
+    {
+        match state.lock() {
+            Err(e) => panic!("cannot lock state at the to write the current entries"),
+            Ok(mut s) => s.write_entries(&cli.state_path)?,
+        }
+    }
+    //lock.write_entries(&cli.state_path);
+
     info!("sha of files is done");
     Ok(())
-
-
-
 }

@@ -14,27 +14,32 @@ structopt::clap::AppSettings::UnifiedHelpMessage
 ]),
 )]
 pub struct Cli {
-    #[structopt(short, long)]
+    #[structopt(short="d", long)]
     /// top of the tree to scan
     pub top_dir: PathBuf,
 
-    #[structopt(short, long)]
+    #[structopt(long)]
     /// Number of directory scanning threads
     ///
     /// These threads find the files to perform sha1 on
-    pub dir_threads: usize,
+    pub threads_dir: usize,
 
-    #[structopt(short, long)]
+    #[structopt(long)]
     /// Number of sha1 threads
     ///
     /// These threads find the files to perform sha1 on
-    pub sha_threads: usize,
+    pub threads_sha: usize,
 
     #[structopt(short = "v", parse(from_occurrences))]
     /// log level - e.g. -vvv is the same as debug while -vv is info level
     ///
     /// To true debug your settings you might try trace level or -vvvv
     pub verbosity: usize,
+
+    #[structopt(short, long)]
+    /// state file path
+    pub state_path: PathBuf,
+
 }
 
 pub fn get_cli() -> Cli {
