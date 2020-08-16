@@ -16,12 +16,26 @@ use std::fs;
 
 mod cli;
 mod worker_queue;
+
 use worker_queue::WorkerQueue;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crate::sha_state::{ShaState, ShaSet, DiffResult};
 use std::sync::{Arc, RwLock, Mutex};
 use crate::cli::Cli;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+pub struct Stats {
+    pub fc: AtomicUsize,
+    pub bc: AtomicUsize,
+}
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref stats: Stats = Stats{ fc: AtomicUsize::new(0), bc: AtomicUsize::new(0) };
+}
+
 
 fn main() {
     if let Err(err) = sha_them_all() {
@@ -46,7 +60,7 @@ fn _read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, send: &mut Sender<
         match queue.pop() {
             None => return Ok(()),
             Some(path) => {
-                debug!("scanning dir {}", path.display());
+                trace!("scanning dir {}", path.display());
                 let dir_itr = match std::fs::read_dir(&path) {
                     Err(e) => {
                         error!("stat of dir: '{}', error: {}", path.display(), e);
@@ -80,55 +94,69 @@ fn _read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, send: &mut Sender<
     }
 }
 
-fn sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) {
+fn sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) -> usize {
+    let mut size = 0;
     loop {
         match _sha_files(recv, send) {
             Err(e) => {
                 error!("sha_file thread top: {}", e);
             }
-            Ok(()) => break,
+            Ok(s) => {
+                size += s;
+                break
+            },
         }
     }
-
+    size
 }
 
-fn _sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) -> Result<()> {
-    let mut buf = vec![0u8; 64*1024*1024];
+fn _sha_files(recv: &Receiver<Option<PathBuf>>, send: &Sender<Option<ShaState>>) -> Result<usize> {
+    let mut buf = vec![0u8; 64 * 1024 * 1024];
+    let mut size = 0;
     loop {
         trace!("waiting...");
         match recv.recv()? {
-            None => return Ok(()), // this is the end my friend
+            None => return Ok(size), // this is the end my friend
             Some(path) => {
                 match sha_a_file(&path, &mut buf) {
-                    Err(e) => {error!("sha1 on file fail"); ()},
-                    Ok(state) => {send.send(Some(state))?; ()},
+                    Err(e) => {
+                        error!("sha1 on file {} failed, {}", &path.display(), e);
+                        ()
+                    }
+                    Ok( (state,sz)) => {
+                        size += sz;
+                        stats.bc.fetch_add(sz, Ordering::Relaxed);
+                        stats.fc.fetch_add(1, Ordering::Relaxed);
+                        send.send(Some(state))?;
+                        ()
+                    }
                 }
-            },
+            }
         };
     }
 }
 
-fn sha_a_file(path: &Path, buf: &mut Vec<u8>) -> Result<ShaState> {
+fn sha_a_file(path: &Path, buf: &mut Vec<u8>) -> Result<(ShaState, usize)> {
     let mut file = fs::File::open(&path).context("open failed")?;
-    let hash = sha1_digest(&mut file, buf).context("digest_reader failed")?;
-    info!("path: \"{}\" sha1: {}", path.display(), &hash.to_string());
+    let (hash,size) = sha1_digest(&mut file, buf).context("digest_reader failed")?;
+    trace!("path: \"{}\" sha1: {}", path.display(), &hash.to_string());
     let mtime = path.metadata()?.modified()?;
-    Ok(ShaState::new(path.to_path_buf(), hash, mtime))
+    Ok((ShaState::new(path.to_path_buf(), hash, mtime), size))
 }
-fn sha1_digest<R: Read>(mut reader: R, buf: &mut Vec<u8>) -> Result<Digest> {
-    trace!("doing sha1 on file");
-    let mut m = sha1::Sha1::new();
-    //let mut buffer = [0; 1024*1024];
 
+fn sha1_digest<R: Read>(mut reader: R, buf: &mut Vec<u8>) -> Result<(Digest, usize)> {
+    let mut m = sha1::Sha1::new();
+    let mut size = 0;
     loop {
         let count = reader.read(&mut buf[..])?;
+        size += count;
         if count == 0 {
             break;
         }
         m.update(&buf[..count]);
     }
 
-    Ok(m.digest())
+    Ok((m.digest(), size))
 }
 
 fn record_state(cli: &Arc<Cli>, recv: Receiver<Option<ShaState>>, state: &mut Arc<Mutex<ShaSet>>) {
@@ -145,6 +173,7 @@ fn record_state(cli: &Arc<Cli>, recv: Receiver<Option<ShaState>>, state: &mut Ar
                             Err(e) => error!("Cannot add entry for {} due to {}", info, e),
                             Ok(diff) => {
                                 match diff {
+                                    DiffResult::BothDiff => warn!("SHA TIME CHANGE: {}", info),
                                     DiffResult::ShaDiff => warn!("SHA CHANGE: {}", info),
                                     DiffResult::TimeDiff => warn!("TIME CHANGE: {}", info),
                                     _ => (),
@@ -153,13 +182,23 @@ fn record_state(cli: &Arc<Cli>, recv: Receiver<Option<ShaState>>, state: &mut Ar
                         }
                     }
                 }
-
             }
         }
     }
 }
 
-fn sha_them_all() -> Result<()>{
+fn ticker() {
+    let mut bc = 0;
+    let mut fc = 0;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        bc = stats.bc.load(Ordering::Relaxed);
+        fc = stats.fc.load(Ordering::Relaxed);
+        info!("TICK  {} files  {} GB", fc, bc/(1024*1024*1024));
+    }
+}
+
+fn sha_them_all() -> Result<()> {
     println!("Hello, world!");
     let cli = Arc::new(crate::cli::get_cli());
 
@@ -171,16 +210,20 @@ fn sha_them_all() -> Result<()>{
         .init()
         .unwrap();
 
+    let h_ticker = spawn(move || ticker());
+
     let mut dir_q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(cli.threads_dir, 0);
-    let (send,recv) = crossbeam_channel::unbounded();
-    let (send_state,recv_state) = crossbeam_channel::unbounded();
+    let (send, recv) = crossbeam_channel::unbounded();
+    let (send_state, recv_state) = crossbeam_channel::unbounded();
 
     let mut state = Arc::new(Mutex::new(ShaSet::new(&cli.state_path)?));
+
+    let start = Instant::now();
 
     let h_state_write = {
         let cli_c = cli.clone();
         let mut state_c = state.clone();
-        spawn(move|| record_state(&cli_c, recv_state, &mut state_c))
+        spawn(move || record_state(&cli_c, recv_state, &mut state_c))
     };
 
     let mut h_dir_threads = vec![];
@@ -216,21 +259,21 @@ fn sha_them_all() -> Result<()>{
 
     // wait on sha threads
     for _ in 0..cli.threads_sha { send.send(None)?; }
+    let mut tot_bytes = 0;
     for h in h_sha_threads {
-        h.join().unwrap();
+        tot_bytes += h.join().unwrap();
     }
+    let secs = start.elapsed().as_secs_f64();
+    let rate = (tot_bytes as f64 / secs)/(1024.0*1024.0);
+    info!("sha of files is done in {:.3} secs {} total  {:.2}MB/ sec", secs, tot_bytes, rate);
 
     send_state.send(None)?;
     h_state_write.join().unwrap();
 
-    {
-        match state.lock() {
-            Err(e) => panic!("cannot lock state at the to write the current entries"),
-            Ok(mut s) => s.write_entries(&cli.state_path)?,
-        }
+    match state.lock() { // this match is needed I think because LockGuard points to special version of Result
+        Err(e) => panic!("cannot lock state at the to write the current entries"),
+        Ok(mut s) => s.write_entries(&cli.state_path)?,
     }
-    //lock.write_entries(&cli.state_path);
 
-    info!("sha of files is done");
     Ok(())
 }

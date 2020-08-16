@@ -5,19 +5,20 @@
 
 use std::path::{PathBuf, Path};
 use sha1::Digest;
-use anyhow::{bail, anyhow, Context};
+use anyhow::{bail, anyhow, Context, Result};
 use log::{debug, error, info, trace, warn};
 use std::sync::{Arc, RwLock};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, Duration, Instant};
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write, BufReader};
 use std::str::FromStr;
 use std::cmp::Ordering;
 use std::ops::Add;
-type Result<T> = anyhow::Result<T, anyhow::Error>;
+use serde::{ser, de, Serialize, Deserialize};
 
-#[derive(Debug, Eq, Clone)]
+
+#[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct ShaState {
     path: PathBuf,
     sha: Digest,
@@ -64,9 +65,26 @@ fn digest_from_str(dig_str: &str) -> Result<Digest> {
     }
 }
 
+/*
+type ResultSer<T,E> = std::result::Result<T,E>;
+impl Serialize for Digest {
+    fn serialize<S>(&self, serializer: S) -> ResultSer<<S as Serializer>::Ok, <S as Serializer>::Error> where
+        S: Serializer {
+        serializer.serialize_str(self.to_string()?)?
+    }
+}
+
+impl Deserialize for Digest {
+    fn deserialize<D>(deserializer: D) -> ResultSer<Self, <D as Deserializer<'de>>::Error> where
+        D: Deserializer<'de> {
+        unimplemented!()
+    }
+}
+*/
+
 impl ShaState {
     pub fn new(path: PathBuf, sha: Digest, mtime: SystemTime) -> Self {
-        ShaState { path, sha, mtime, t_deltas: 0, sha_deltas: 0 }
+        ShaState { path: path, sha: sha, mtime: mtime, t_deltas: 0, sha_deltas: 0 }
     }
 
     fn from_str(s: &str) -> Result<Self> {
@@ -106,42 +124,65 @@ impl ShaState {
 #[derive(Debug, Clone)]
 pub enum DiffResult {
     Added,
+    BothDiff,
     ShaDiff,
     TimeDiff,
     Same,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ShaSet(BTreeSet<ShaState>);
 
 impl ShaSet {
-    pub(crate) fn new(file: &PathBuf) -> Result<Self> {
-        let mut set = BTreeSet::new();
-        ShaSet::entries_from(&file, &mut set)?;
-        Ok(ShaSet(set))
+    pub(crate) fn new(path: &PathBuf) -> Result<Self> {
+        let now = SystemTime::now();
+
+        let f_h = match File::open(&path) {
+            Err(e) => {
+                warn!("There is no initial state file at \"{}\", so going with an initial empty one. {}", path.display(), e);
+                return Ok(ShaSet(BTreeSet::new()));
+            }
+            Ok(f) => f,
+        };
+        let start = Instant::now();
+        let buf = BufReader::new(f_h);
+        let set: ShaSet = serde_json::from_reader(buf)?;
+        info!("read state file: \"{}\" in {:.3} secs", path.display(), start.elapsed().as_secs_f64());
+        // let mut de = serde_json::Deserializer::from_reader(&f_h);
+        //
+        // let set:ShaSet = ShaSet::deserialize(de)?;
+
+        Ok(set)
     }
 
-    pub fn add(&mut self, entry: ShaState) -> Result<DiffResult> {
+    pub fn add(&mut self, mut e: ShaState) -> Result<DiffResult> {
         let mut res = Ok(DiffResult::Added);
-        {
-            match self.0.take(&entry) {
-                Some(mut v) => {
-                    if v.sha != entry.sha {
-                        v.sha_deltas + 1;
-                        res = Ok(DiffResult::ShaDiff);
-                    } else if v.mtime != entry.mtime {
-                        v.t_deltas += 1;
-                        res = Ok(DiffResult::TimeDiff);
-                    } else {
-                        res = Ok(DiffResult::Same);
+        match self.0.take(&e) {
+            Some(mut v) => {
+                match (v.sha == e.sha, v.mtime == e.mtime) {
+                    (true, true) => res = Ok(DiffResult::Same),
+                    (false, false) => {
+                        e.sha_deltas = v.sha_deltas + 1;
+                        e.t_deltas = v.t_deltas + 1;
+                        res = Ok(DiffResult::BothDiff)
                     }
-                    self.0.insert(v);
-                    return res;
+                    (true, false) => {
+                        e.t_deltas = v.t_deltas + 1;
+                        res = Ok(DiffResult::TimeDiff)
+                    }
+                    (false, true) => {
+                        e.sha_deltas = v.sha_deltas + 1;
+                        res = Ok(DiffResult::ShaDiff)
+                    }
                 }
-                _ => (),
+                self.0.insert(e);
+                return res;
+            }
+            None => {
+                self.0.insert(e);
+                return Ok(DiffResult::Added);
             }
         }
-        self.0.insert(entry);
-        return Ok(DiffResult::Added);
     }
 
     fn entries_from(path: &Path, set: &mut BTreeSet<ShaState>) -> Result<()> {
@@ -185,9 +226,11 @@ impl ShaSet {
             let file = File::create(&tmppath)
                 .with_context(|| format!("Unable to create tmpfile: \"{}\" to write tracking data too", &tmppath.display()))?;
             let mut buf = BufWriter::new(&file);
-            for e in self.0.iter() {
-                e.write(&mut buf)?;
-            }
+
+            serde_json::to_writer_pretty(buf, &self)?;
+            // for e in self.0.iter() {
+            //     e.write(&mut buf)?;
+            // }
         }
         std::fs::rename(&tmppath, &path)
             .with_context(|| format!("Unable to post rename tmp file after writing tracking information: rename \"{}\" to \"{}\"", &tmppath.display(), &path.display()))?;
