@@ -4,7 +4,6 @@
 
 mod sha_state;
 
-
 use std::thread::spawn;
 use std::path::{PathBuf, Path};
 use crossbeam_channel::{Sender, Receiver};
@@ -39,7 +38,7 @@ lazy_static! {
 
 fn main() {
     if let Err(err) = sha_them_all() {
-        eprintln!("ERROR in main: {}", &err);
+        eprintln!("ERROR in main: {}, {:#?}",&err, &err);
         std::process::exit(1);
     }
 }
@@ -199,7 +198,7 @@ fn ticker() {
 }
 
 fn sha_them_all() -> Result<()> {
-    println!("Hello, world!");
+
     let cli = Arc::new(crate::cli::get_cli());
 
     stderrlog::new()
